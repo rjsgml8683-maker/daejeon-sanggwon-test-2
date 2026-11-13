@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 try:
     import folium
@@ -277,29 +278,66 @@ months = d["crtr_ym"].tolist()
 recent = share[-3:].mean()
 center, lowb, highb, slope = forecast(share, 3)
 
-# ── 머리 숫자 네 개
+# ── 머리 카드 (직접 만든 HTML)
 rank = int(stat["리스크점수"].rank(method="min", ascending=False)
            [(stat["지역"] == gu) & (stat["동"] == dong)].iloc[0])
-n1, n2, n3, n4 = (st.container(), st.container(), st.container(),
-                  st.container()) if mobile else st.columns(4)
-n1.markdown(f"### {recent:.2f}%")
-n1.caption("대전 전체 중 우리 동네 몫")
-n2.markdown(f"### {rank}위")
-n2.caption(f"{len(stat)}개 동네 중 흔들림 순위")
-n3.markdown(f"### {row['잔존율']:.0f}%")
-n3.caption("결제 저점기에 남은 결제액")
-n4.markdown(f"### {row['최대고객층비중']:.0f}%")
-n4.caption(f"{row['최대고객층']} 손님 비중")
+trend_word = ("올라가는 중" if slope > 0.005
+              else ("내려가는 중" if slope < -0.005 else "비슷한 수준"))
+accent = {"조심": "#c0392b", "주의": "#c77700", "안심": "#157f5a"}[grade]
+soft = {"조심": "#fdeceb", "주의": "#fdf3e3", "안심": "#e9f6f0"}[grade]
+
+card = f"""
+<div style="font-family:'Noto Sans KR',system-ui,sans-serif;color:#171717;
+            border:1px solid #e6e6e6;border-radius:18px;padding:28px 30px;
+            background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.04)">
+  <div style="font-size:13px;color:#8a8a8a;letter-spacing:.02em">
+    대전광역시 · {gu} · {fmt_ym(span[0])}~{fmt_ym(span[-1])}
+  </div>
+  <div style="display:flex;align-items:baseline;gap:12px;margin:6px 0 18px">
+    <span style="font-size:30px;font-weight:700;letter-spacing:-.03em">{dong}</span>
+    <span style="background:{soft};color:{accent};font-size:14px;font-weight:700;
+                 padding:5px 14px;border-radius:999px">{grade}</span>
+  </div>
+  <div style="font-size:19px;line-height:1.55;font-weight:500;margin-bottom:22px">
+    {headline(row, grade)}
+  </div>
+  <div style="display:flex;flex-wrap:wrap;gap:0;border-top:1px solid #f0f0f0;
+              padding-top:18px">
+    <div style="flex:1;min-width:120px">
+      <div style="font-size:12px;color:#8a8a8a;margin-bottom:4px">우리 동네 몫</div>
+      <div style="font-size:24px;font-weight:700">{recent:.2f}<span
+           style="font-size:14px;font-weight:500">%</span></div>
+      <div style="font-size:12px;color:#8a8a8a">최근 석 달</div>
+    </div>
+    <div style="flex:1;min-width:120px">
+      <div style="font-size:12px;color:#8a8a8a;margin-bottom:4px">흔들림 순위</div>
+      <div style="font-size:24px;font-weight:700">{rank}<span
+           style="font-size:14px;font-weight:500">위</span></div>
+      <div style="font-size:12px;color:#8a8a8a">{len(stat)}개 동네 중</div>
+    </div>
+    <div style="flex:1;min-width:120px">
+      <div style="font-size:12px;color:#8a8a8a;margin-bottom:4px">저점기 잔존율</div>
+      <div style="font-size:24px;font-weight:700">{row['잔존율']:.0f}<span
+           style="font-size:14px;font-weight:500">%</span></div>
+      <div style="font-size:12px;color:#8a8a8a">한산한 달에 남는 결제</div>
+    </div>
+    <div style="flex:1;min-width:120px">
+      <div style="font-size:12px;color:#8a8a8a;margin-bottom:4px">주요 손님층</div>
+      <div style="font-size:24px;font-weight:700">{row['최대고객층']}</div>
+      <div style="font-size:12px;color:#8a8a8a">결제의 {row['최대고객층비중']:.0f}%</div>
+    </div>
+  </div>
+  <div style="margin-top:20px;padding:14px 16px;background:#fafafa;
+              border-radius:12px;font-size:14px;line-height:1.6;color:#3f3f3f">
+    이 기간 평균은 <b>{row['평균점유율']:.2f}%</b>였고 최근 석 달은
+    <b>{recent:.2f}%</b>로 {trend_word}입니다.
+    흐름이 이어진다면 석 달 뒤에는 <b>{center[-1]:.2f}%</b> 언저리가 됩니다.
+  </div>
+</div>
+"""
+components.html(card, height=330 if not mobile else 520, scrolling=False)
 
 st.write("")
-st.markdown(f"## :{color}[{grade}] · {dong}은 {headline(row, grade)}")
-
-trend_word = "올라가는 중" if slope > 0.005 else ("내려가는 중" if slope < -0.005 else "비슷한 수준")
-st.markdown(
-    f"{fmt_ym(span[0])}부터 {fmt_ym(span[-1])}까지 이 동네에서 지역화폐로 결제된 돈은 대전 전체의 "
-    f"평균 **{row['평균점유율']:.2f}%**였습니다. 최근 석 달은 **{recent:.2f}%**로 "
-    f"{trend_word}이고, 흐름이 이어진다면 석 달 뒤에는 **{center[-1]:.2f}%** 언저리가 됩니다.")
-
 st.write("")
 st.markdown("#### 우리 동네 지역화폐 소비는 이렇게 움직였습니다")
 
