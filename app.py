@@ -1,5 +1,4 @@
 import time
-from datetime import date
 
 import numpy as np
 import pandas as pd
@@ -13,7 +12,7 @@ try:
 except Exception:
     HAS_FOLIUM = False
 
-st.set_page_config(page_title="대전 지역화폐 결제 패턴 진단",
+st.set_page_config(page_title="우리 동네 지역화폐 리스크 진단",
                    page_icon="📊", layout="wide")
 
 URL = "https://apis.data.go.kr/B190001/localGiftsPaymentV3/paymentsV3"
@@ -22,7 +21,7 @@ REGIONS = {"30110": "동구", "30140": "중구", "30170": "서구",
 AGES = {"01": "19세 이하", "02": "20대", "03": "30대",
         "04": "40대", "05": "50대", "06": "60대 이상", "99": "미상"}
 GREEN = "#157f5a"
-W_POLICY, W_MIX, W_TREND = 0.4, 0.3, 0.3   # 탐색적 가중치: 검증된 예측 모형이 아님
+W_POLICY, W_MIX, W_TREND = 0.4, 0.3, 0.3   # 가중치
 
 
 # ──────────────────────────────── 데이터
@@ -40,10 +39,7 @@ def load(start_ym: str, end_ym: str) -> pd.DataFrame:
                 "cond[crtr_ym::GTE]": start_ym, "cond[crtr_ym::LTE]": end_ym,
                 "returnType": "JSON"}, timeout=60)
             res.raise_for_status()
-            payload = res.json()
-            batch = payload.get("data", [])
-            if not isinstance(batch, list):
-                raise ValueError("공공데이터 API 응답 형식이 예상과 다릅니다.")
+            batch = res.json().get("data", [])
             rows += batch
             if len(batch) < 1000:
                 break
@@ -57,7 +53,7 @@ def load(start_ym: str, end_ym: str) -> pd.DataFrame:
         return df
     df["crtr_ym"] = df["crtr_ym"].astype(str)
     df["지역"] = df["usage_rgn_cd"].map(REGIONS)
-    df["동"] = df["emd_nm"].fillna("기타").astype(str).str.strip()
+    df["동"] = df["emd_nm"].fillna("기타")
     df["연령대"] = df["par_ag"].map(AGES).fillna("미상")
     df["성별"] = df["par_gend"].map({"M": "남성", "F": "여성"}).fillna("미상")
     for c in ["stlm_amt", "stlm_nocs"]:
@@ -75,71 +71,59 @@ def load_coords() -> pd.DataFrame:
 
 
 def build(df: pd.DataFrame, min_share: float):
-    """대전 지역화폐 결제 패턴에 대한 상대적 탐색 지표."""
-    base = df[(df["동"] != "기타") & df["지역"].notna()].copy()
+    """월 × 행정동 집계와 세 가지 리스크 지표를 계산한다."""
+    base = df[df["동"] != "기타"]
     m = (base.groupby(["crtr_ym", "지역", "동"], as_index=False)
          .agg(결제금액=("stlm_amt", "sum"), 결제건수=("stlm_nocs", "sum")))
-    if m.empty:
-        return m, pd.DataFrame(), [], []
+    m["점유율"] = m["결제금액"] / m.groupby("crtr_ym")["결제금액"].transform("sum") * 100
+    n_month = m["crtr_ym"].nunique()
+    m = m[m.groupby(["지역", "동"])["crtr_ym"].transform("count") == n_month]
 
-    # 분모는 필터를 통과한 지역이 아닌 모든 지역의 동일 월 결제액
-    all_totals = df.groupby("crtr_ym")["stlm_amt"].sum()
-    m["점유율"] = m["결제금액"] / m["crtr_ym"].map(all_totals).replace(0, np.nan) * 100
-    months = sorted(m["crtr_ym"].unique())
-    if len(months) < 6:
-        return m, pd.DataFrame(), [], []
-
-    n_month = len(months)
-    complete = m.groupby(["지역", "동"])["crtr_ym"].transform("nunique") == n_month
-    valid = m[complete]
-    amt = valid.pivot(index=["지역", "동"], columns="crtr_ym", values="결제금액")
-    shr = valid.pivot(index=["지역", "동"], columns="crtr_ym", values="점유율")
+    amt = m.pivot_table(index=["지역", "동"], columns="crtr_ym", values="결제금액")
+    shr = m.pivot_table(index=["지역", "동"], columns="crtr_ym", values="점유율")
     keep = shr.mean(axis=1) >= min_share
-    amt, shr = amt.loc[keep], shr.loc[keep]
-    if shr.empty:
-        return m, pd.DataFrame(), [], []
+    amt, shr = amt[keep], shr[keep]
     cols = list(shr.columns)
+
     stat = pd.DataFrame(index=shr.index)
     stat["평균점유율"] = shr.mean(axis=1)
-    stat["변동계수"] = shr.std(axis=1) / shr.mean(axis=1).replace(0, np.nan)
+    stat["변동계수"] = shr.std(axis=1) / shr.mean(axis=1)
 
-    # 결제 저점기와 고점기 비교. 예산의 인과 효과로 해석하지 않는다.
-    total = all_totals.reindex(cols).sort_values()
+    # ① 저점기 잔존율 — 대전 전체 결제가 가장 적었던 달들과 가장 많았던 달들을 비교
+    total = m.groupby("crtr_ym")["결제금액"].sum().sort_values()
     k = max(2, len(cols) // 4)
     low_m, high_m = list(total.index[:k]), list(total.index[-k:])
-    stat["잔존율"] = amt[low_m].mean(axis=1) / amt[high_m].mean(axis=1).replace(0, np.nan) * 100
+    stat["잔존율"] = amt[low_m].mean(axis=1) / amt[high_m].mean(axis=1) * 100
 
+    # ② 고객층 집중 — 성별 × 연령대 결제액의 허핀달 지수(0~1, 클수록 쏠림)
     recent = base[base["crtr_ym"].isin(cols[-12:])]
-    by_group = recent.groupby(["지역", "동", "성별", "연령대"])["stlm_amt"].sum()
-    mix = by_group.groupby(level=[0, 1]).apply(
-        lambda x: ((x / x.sum()) ** 2).sum() if x.sum() > 0 else np.nan)
+    mix = (recent.groupby(["지역", "동", "성별", "연령대"])["stlm_amt"].sum()
+           .groupby(level=[0, 1]).apply(lambda x: ((x / x.sum()) ** 2).sum()))
     stat["집중도"] = mix.reindex(stat.index)
-    top = by_group.groupby(level=[0, 1]).idxmax().apply(lambda t: f"{t[2]} {t[3]}")
+    top = (recent.groupby(["지역", "동", "성별", "연령대"])["stlm_amt"].sum()
+           .groupby(level=[0, 1]).idxmax().apply(lambda t: f"{t[2]} {t[3]}"))
     stat["최대고객층"] = top.reindex(stat.index)
-    share_top = by_group.groupby(level=[0, 1]).apply(
-        lambda x: x.max() / x.sum() * 100 if x.sum() > 0 else np.nan)
+    share_top = (recent.groupby(["지역", "동", "성별", "연령대"])["stlm_amt"].sum()
+                 .groupby(level=[0, 1]).apply(lambda x: x.max() / x.sum() * 100))
     stat["최대고객층비중"] = share_top.reindex(stat.index)
 
+    # ③ 하락 지속 — 최근 6개월 중 전월보다 떨어진 달 수와 3개월 추세
     s6 = shr[cols[-6:]]
     stat["하락개월"] = (s6.diff(axis=1).iloc[:, 1:] < 0).sum(axis=1)
     stat["최근추세"] = (shr[cols[-3:]].mean(axis=1) /
-                    shr[cols[-6:-3]].mean(axis=1).replace(0, np.nan) - 1) * 100
+                    shr[cols[-6:-3]].mean(axis=1) - 1) * 100
 
-    # 계산이 불가능한 지역은 점수 대상에서 제외
-    stat = stat.replace([np.inf, -np.inf], np.nan).dropna(
-        subset=["잔존율", "집중도", "최근추세", "최대고객층비중"])
-    if stat.empty:
-        return m, pd.DataFrame(), low_m, high_m
-
+    # 0~100 점수화 (클수록 위험)
     def rank01(sr, reverse=False):
-        r = sr.rank(pct=True, method="average")
+        r = sr.rank(pct=True)
         return (1 - r if reverse else r) * 100
 
-    stat["저점점수"] = rank01(stat["잔존율"], reverse=True)
+    stat["정책점수"] = rank01(stat["잔존율"], reverse=True)
     stat["집중점수"] = rank01(stat["집중도"])
     stat["추세점수"] = rank01(stat["하락개월"] * 10 - stat["최근추세"])
-    stat["리스크점수"] = (stat["저점점수"] * W_POLICY +
-                     stat["집중점수"] * W_MIX + stat["추세점수"] * W_TREND)
+    stat["리스크점수"] = (stat["정책점수"] * W_POLICY +
+                     stat["집중점수"] * W_MIX +
+                     stat["추세점수"] * W_TREND)
     return m, stat.reset_index().sort_values("리스크점수", ascending=False), low_m, high_m
 
 
@@ -156,65 +140,82 @@ def forecast(series: np.ndarray, months: int = 3):
 
 def headline(row, grade):
     """한 줄 진단 문장."""
-    body = {"안심": "결제 패턴의 상대적 위험 신호가 적습니다",
-            "주의": "일부 결제 패턴에 주의가 필요합니다",
-            "조심": "결제 패턴의 상대적 위험 신호가 많습니다"}[grade]
+    body = {"안심": "지역화폐 매출이 꾸준한 편입니다",
+            "주의": "지역화폐 매출이 때때로 흔들리는 편입니다",
+            "조심": "지역화폐 매출이 크게 흔들리는 편입니다"}[grade]
     tail = ""
-    top = max([("저점", row["저점점수"]), ("고객층", row["집중점수"]),
+    top = max([("정책", row["정책점수"]), ("고객층", row["집중점수"]),
                ("하락", row["추세점수"])], key=lambda x: x[1])
     if top[1] >= 60:
-        tail = {"저점": " 특히 결제 저점기 상대적 감소가 컸습니다",
-                "고객층": " 특히 지역화폐 이용 고객층이 집중되어 있습니다",
-                "하락": " 특히 최근 점유율 하락 신호가 나타납니다"}[top[0]]
+        tail = {"정책": " 특히 전체 결제가 적은 달에 많이 줄어듭니다",
+                "고객층": " 다만 손님층이 한쪽에 몰려 있는 상권입니다",
+                "하락": " 다만 최근 몇 달 계속 줄어드는 중입니다"}[top[0]]
     return body + tail
+
+
+@st.cache_data(show_spinner=False)
+def backtest(shr_values: tuple, horizon: int = 3) -> float:
+    """과거 구간에서 3개월 선행 예측을 반복해 평균 절대 오차율(MAPE)을 구한다."""
+    errs = []
+    for series in shr_values:
+        y = np.array(series)
+        if len(y) < 12:
+            continue
+        for cut in range(9, len(y) - horizon + 1):
+            train = y[max(0, cut - 12):cut]
+            x = np.arange(len(train))
+            a, b = np.polyfit(x, train, 1)
+            fx = np.arange(len(train), len(train) + horizon)
+            pred = np.clip(a * fx + b, 0.01, None)
+            actual = y[cut:cut + horizon]
+            errs.extend(np.abs(pred - actual) / actual)
+    return float(np.median(errs) * 100) if errs else float("nan")
 
 
 def advise(row, slope):
     """가장 두드러진 한 가지를 중심으로 제안한다."""
     cards = []
-    if row["저점점수"] >= 60:
+    if row["정책점수"] >= 60:
         cards.append((
-            "지역화폐 결제가 적은 달에 하락 폭이 컸어요",
-            f"대전 지역화폐 결제 저점기 평균은 고점기의 {row['잔존율']:.0f}%였습니다.",
-            "지역화폐 발행 정책과 계절별 매출을 함께 확인하세요. "
-            "이 수치만으로 정책 영향이나 가게 전체 매출을 판단할 수는 없습니다."))
+            "결제가 적은 달에 크게 줄어요",
+            f"대전 전체 지역화폐 결제가 가장 적었던 달, 이 동네 결제액은 "
+            f"가장 많았던 달의 {row['잔존율']:.0f}% 수준이었습니다.",
+            "지역화폐 결제가 뜸한 시기를 대비해 운영비 여유를 두세요. "
+            "할인율이나 발행 한도 공지가 뜨면 미리 챙겨 보시고요."))
     if row["집중점수"] >= 60:
         cards.append((
-            "지역화폐 이용층이 한쪽에 몰려 있어요",
+            "손님층이 한쪽에 몰려 있어요",
             f"결제의 {row['최대고객층비중']:.0f}%가 {row['최대고객층']} 손님입니다.",
-            "지역화폐 외 결제 고객의 구성도 확인하고, 다른 연령대의 수요가 있는지 "
-            "소규모 이벤트 등으로 검증해 보세요."))
+            "이 손님들이 줄면 타격이 큽니다. 다른 연령대가 찾을 만한 메뉴나 "
+            "시간대를 하나쯤 만들어 두면 완충이 됩니다."))
     if row["하락개월"] >= 4 or row["최근추세"] < -10:
         cards.append((
             "최근 계속 줄고 있어요",
             f"최근 6개월 중 {int(row['하락개월'])}개월이 전달보다 낮았습니다.",
-            "같은 기간 주변 지역의 지역화폐 점유율도 확인해 보세요. "
+            "가까운 동네로 손님이 옮겨가고 있는지 확인해 보세요. "
             "비교 탭에서 이웃 상권과 나란히 볼 수 있습니다."))
     if not cards:
         cards.append((
             "지금은 별다른 신호가 없어요",
-            "세 지표에서 비교 대상 대비 뚜렷한 높은 위험 신호가 보이지 않습니다.",
+            "세 가지 지표 모두 대전 평균 범위 안에 있습니다.",
             "분기에 한 번 정도 이 화면을 열어 흐름만 확인하시면 충분합니다."))
     if slope > 0.005 and len(cards) <= 1:
         cards.append((
             "최근에는 올라가는 중",
-            "최근 지역화폐 결제 점유율은 상승하는 추세입니다.",
+            "지역화폐 소비 비중이 오르는 추세입니다.",
             "늘어난 방문을 단골로 묶을 방법을 지금 준비해 두면 좋습니다."))
     return cards[:2]
 
 
 # ──────────────────────────────── 화면
-st.title("대전 우리 동네 지역화폐 소비 진단")
-st.info("이 서비스는 **지역화폐 결제 패턴**을 비교합니다. 상권 전체 매출, 폐업 가능성 또는 정책의 인과 효과를 예측하지 않습니다.")
+st.title("우리 동네 지역화폐 리스크 진단")
 
 with st.sidebar:
     st.header("설정")
     mobile = st.checkbox("휴대폰으로 보기", value=False,
                          help="글자가 겹쳐 보이면 켜세요")
     with st.expander("분석 조건 (전문가용)"):
-        this_year = date.today().year
-        years = st.slider("분석 기간 (연도)", 2023, this_year,
-                          (max(2023, this_year - 2), max(2023, this_year - 1)))
+        years = st.slider("분석 기간 (연월)", 2023, 2026, (2024, 2025))
         min_share = st.number_input("최소 평균 비중 (%)", 0.0, 5.0, 0.3, 0.1)
         if st.button("가양동 · 가오동 불러오기", use_container_width=True):
             st.session_state.update(gu="동구", dong="가양동",
@@ -228,21 +229,12 @@ if "SERVICE_KEY" not in st.secrets:
     st.error("인증키가 설정되지 않았습니다. 앱 설정의 Secrets에 SERVICE_KEY를 등록하세요.")
     st.stop()
 
-try:
-    df = load(start_ym, end_ym)
-except (requests.RequestException, ValueError, KeyError) as exc:
-    st.error("데이터를 불러오지 못했습니다. API 키, 응답 형식과 요청 조건을 확인해 주세요.")
-    st.code(str(exc))
-    st.stop()
+df = load(start_ym, end_ym)
 if df.empty:
     st.warning("해당 기간에 데이터가 없습니다. 기간을 바꿔보세요.")
     st.stop()
 
 m, stat, low_m, high_m = build(df, min_share)
-if stat.empty:
-    st.warning("현재 조건에서 분석 가능한 지역이 없습니다. 분석 기간 또는 최소 평균 비중을 조정해 주세요. (최소 6개월의 자료가 필요합니다.)")
-    st.stop()
-st.caption(f"필터를 통과한 {len(stat)}개 행정동만 상대평가합니다. 모든 달에 데이터가 있고 평균 점유율이 {min_share}% 이상이어야 합니다.")
 
 
 def fmt_ym(ym):
@@ -250,15 +242,18 @@ def fmt_ym(ym):
 
 
 span = sorted(m["crtr_ym"].unique())
+all_dong = df[df["동"] != "기타"].groupby(["지역", "동"]).ngroups
 st.caption(f"한국조폐공사 지역사랑상품권 결제정보 · 대전광역시 · "
-           f"{fmt_ym(span[0])} ~ {fmt_ym(span[-1])} 기준 ({len(stat)}개 행정동)")
+           f"{fmt_ym(span[0])} ~ {fmt_ym(span[-1])} 기준 · "
+           f"자료가 있는 {all_dong}개 동네 중 모든 달 기록이 있고 "
+           f"평균 비중 {min_share}% 이상인 {len(stat)}개를 분석했습니다")
 
 view_mode = st.radio("보기", ["사장님용", "분석용"], horizontal=True,
                      label_visibility="collapsed")
 st.write("")
 
 c1, c2 = (st.container(), st.container()) if mobile else st.columns(2)
-gu_list = [g for g in REGIONS.values() if g in stat["지역"].unique()]
+gu_list = list(REGIONS.values())
 gu = c1.selectbox("자치구", gu_list,
                   index=gu_list.index(st.session_state.get("gu", "유성구")))
 pool = stat[stat["지역"] == gu].sort_values("평균점유율", ascending=False)
@@ -267,7 +262,11 @@ _d = st.session_state.get("dong")
 dong = c2.selectbox("행정동", dong_list,
                     index=dong_list.index(_d) if _d in dong_list else 0)
 
-row = stat[(stat["지역"] == gu) & (stat["동"] == dong)].iloc[0]
+_sel = stat[(stat["지역"] == gu) & (stat["동"] == dong)]
+if _sel.empty:
+    st.warning("선택한 동네는 분석 조건에 맞는 자료가 없습니다. 다른 동네를 골라 주세요.")
+    st.stop()
+row = _sel.iloc[0]
 score = row["리스크점수"]
 grade = "조심" if score >= 66 else ("주의" if score >= 33 else "안심")
 color = {"조심": "red", "주의": "orange", "안심": "green"}[grade]
@@ -279,27 +278,27 @@ recent = share[-3:].mean()
 center, lowb, highb, slope = forecast(share, 3)
 
 # ── 머리 숫자 네 개
-rank = int((stat["리스크점수"] > score).sum()) + 1
+rank = int(stat["리스크점수"].rank(method="min", ascending=False)
+           [(stat["지역"] == gu) & (stat["동"] == dong)].iloc[0])
 n1, n2, n3, n4 = (st.container(), st.container(), st.container(),
                   st.container()) if mobile else st.columns(4)
 n1.markdown(f"### {recent:.2f}%")
 n1.caption("대전 전체 중 우리 동네 몫")
 n2.markdown(f"### {rank}위")
-n2.caption(f"분석 대상 {len(stat)}개 중 상대위험 순위 (1위가 높음)")
+n2.caption(f"{len(stat)}개 동네 중 흔들림 순위")
 n3.markdown(f"### {row['잔존율']:.0f}%")
-n3.caption("지역화폐 결제 저점기/고점기 비율")
+n3.caption("결제 저점기에 남은 결제액")
 n4.markdown(f"### {row['최대고객층비중']:.0f}%")
-n4.caption(f"{row['최대고객층']} 지역화폐 결제액 비중")
+n4.caption(f"{row['최대고객층']} 손님 비중")
 
 st.write("")
 st.markdown(f"## :{color}[{grade}] · {dong}은 {headline(row, grade)}")
 
 trend_word = "올라가는 중" if slope > 0.005 else ("내려가는 중" if slope < -0.005 else "비슷한 수준")
 st.markdown(
-    f"선택한 분석 기간에 이 동네 지역화폐 결제액은 수집된 대전 결제액의 "
-    f"평균 **{row['평균점유율']:.2f}%**를 차지했습니다. 최근 석 달은 **{recent:.2f}%**이며, "
-    f"단순 직선 추세는 {trend_word}입니다. 같은 흐름을 기계적으로 연장하면 "
-    f"석 달 뒤 **{center[-1]:.2f}%**로 추정됩니다. (검증된 예측치는 아닙니다.)")
+    f"{fmt_ym(span[0])}부터 {fmt_ym(span[-1])}까지 이 동네에서 지역화폐로 결제된 돈은 대전 전체의 "
+    f"평균 **{row['평균점유율']:.2f}%**였습니다. 최근 석 달은 **{recent:.2f}%**로 "
+    f"{trend_word}이고, 흐름이 이어진다면 석 달 뒤에는 **{center[-1]:.2f}%** 언저리가 됩니다.")
 
 st.write("")
 st.markdown("#### 우리 동네 지역화폐 소비는 이렇게 움직였습니다")
@@ -316,8 +315,15 @@ front = pd.DataFrame(index=months + fut)
 front["지금까지"] = list(share) + [np.nan] * 3
 front["앞으로 예상"] = pad + list(center)
 st.line_chart(front, height=300, color=[GREEN, "#bdbdbd"])
-st.caption("지역화폐 결제 점유율(%) 그래프입니다. 회색 선은 최근 최대 12개월의 선형 추세를 연장한 시나리오이며, "
-           "예측 오차를 검증하지 않아 실제 미래 수치로 해석하면 안 됩니다.")
+mape = backtest(tuple(tuple(v) for v in
+                      m.pivot_table(index=["지역", "동"], columns="crtr_ym",
+                                    values="점유율").dropna().to_numpy()))
+st.caption("금액이 아니라 대전 전체에서 차지하는 몫입니다. "
+           "금액은 전 지역이 함께 오르내리기 때문입니다. "
+           + (f"예상은 지난 흐름을 그대로 이어 본 값입니다. 같은 방식으로 과거를 "
+              f"되짚어 보면 석 달 뒤 값이 실제와 중앙값 기준 {mape:.0f}% 어긋났습니다."
+              if mape == mape else
+              "예상은 지난 흐름을 그대로 이어 본 단순 추정이라 실제와 다를 수 있습니다."))
 
 st.write("")
 st.markdown("#### 이웃과 견주면")
@@ -326,11 +332,12 @@ cmp = pd.DataFrame({
     "구분": [f"{dong}", f"{gu} 평균", "대전 평균"],
     "지역화폐 소비 몫": [f"{row['평균점유율']:.2f}%", f"{gu_avg:.2f}%",
                   f"{stat['평균점유율'].mean():.2f}%"],
-    "결제 저점기 잔존율": [f"{row['잔존율']:.1f}%",
+    "저점기 잔존율": [f"{row['잔존율']:.1f}%",
                       f"{stat[stat['지역'] == gu]['잔존율'].mean():.1f}%",
                       f"{stat['잔존율'].mean():.1f}%"],
     "흔들림 점수": [f"{score:.0f}점",
-               f"{stat[stat['지역'] == gu]['리스크점수'].mean():.0f}점", f"{stat['리스크점수'].mean():.0f}점"]})
+               f"{stat[stat['지역'] == gu]['리스크점수'].mean():.0f}점",
+               f"{stat['리스크점수'].mean():.0f}점"]})
 st.dataframe(cmp, hide_index=True, use_container_width=True)
 
 st.write("")
@@ -409,14 +416,50 @@ with t1:
              (df["crtr_ym"].isin(months[-12:]))]
     pv = sub.pivot_table(index="연령대", columns="성별",
                          values="stlm_amt", aggfunc="sum").fillna(0)
-    st.bar_chart((pv / pv.values.sum() * 100).round(1), height=320)
+    st.bar_chart((pv / pv.values.sum() * 100).round(1), height=300)
     st.caption(f"가장 큰 손님층은 {row['최대고객층']}으로 전체의 "
                f"{row['최대고객층비중']:.0f}%입니다.")
 
+    if len(months) >= 24:
+        st.markdown("##### 손님층이 어떻게 바뀌었나")
+        prev = df[(df["지역"] == gu) & (df["동"] == dong) &
+                  (df["crtr_ym"].isin(months[-24:-12]))]
+        def mix_of(frame):
+            t = frame.groupby("연령대")["stlm_amt"].sum()
+            return t / t.sum() * 100
+        now_mix, old_mix = mix_of(sub), mix_of(prev)
+        chg = pd.DataFrame({"지지난해": old_mix, "지난해": now_mix}).fillna(0)
+        chg["변화"] = (chg["지난해"] - chg["지지난해"]).round(1)
+        chg = chg.round(1).sort_index()
+        st.dataframe(chg, use_container_width=True)
+        up = chg["변화"].idxmax()
+        down = chg["변화"].idxmin()
+        st.caption(f"{up} 손님 비중이 가장 많이 늘었고({chg.loc[up, '변화']:+.1f}%p), "
+                   f"{down} 손님이 가장 많이 줄었습니다({chg.loc[down, '변화']:+.1f}%p). "
+                   "손님층이 바뀌면 잘 팔리는 메뉴와 시간대도 달라집니다.")
+
 with t2:
     st.caption("달마다 이 동네에서 지역화폐로 결제된 금액입니다. "
-               "발행 정책, 계절성, 지역 수요 등 여러 요인의 영향을 받을 수 있습니다.")
-    st.bar_chart((d.set_index("crtr_ym")["결제금액"] / 1e8).rename("억 원"), height=320)
+               "전체가 함께 오르내리는 것은 상권이 아니라 발행 규모 때문입니다.")
+    st.bar_chart((d.set_index("crtr_ym")["결제금액"] / 1e8).rename("억 원"), height=300)
+
+    st.markdown("##### 해마다 되풀이되는 달별 패턴")
+    dd = d.copy()
+    dd["월"] = dd["crtr_ym"].str[4:].astype(int)
+    years_in = dd["crtr_ym"].str[:4].nunique()
+    if years_in >= 2:
+        season = dd.groupby("월")["점유율"].mean()
+        season = (season / season.mean() * 100).round(0)
+        season.index = [f"{i}월" for i in season.index]
+        st.bar_chart(season.rename("평달을 100으로 봤을 때"), height=280,
+                     color=GREEN)
+        hi, lo = season.idxmax(), season.idxmin()
+        st.caption(f"{hi}이 가장 활발하고({season.max():.0f}) {lo}이 가장 한산합니다"
+                   f"({season.min():.0f}). 같은 달끼리 묶어 평균을 낸 값이라 "
+                   "해마다 되풀이되는 흐름을 봅니다. 재고와 인력 계획에 참고하세요.")
+    else:
+        st.caption("달별 패턴은 두 해 이상 자료가 있어야 볼 수 있습니다. "
+                   "왼쪽 설정에서 기간을 늘려 보세요.")
 
 if view_mode == "분석용":
   with t3:
@@ -435,7 +478,7 @@ if view_mode == "분석용":
     st.markdown("##### 이 동네의 세 가지 지표")
     g1, g2, g3 = st.columns(3)
     for col, label, val, note in [
-            (g1, "결제 저점기 민감도", row["저점점수"], f"결제 저점기 잔존율 {row['잔존율']:.1f}%"),
+            (g1, "저점기 잔존율", row["정책점수"], f"결제 저점기 잔존율 {row['잔존율']:.1f}%"),
             (g2, "손님층 집중", row["집중점수"],
              f"{row['최대고객층']} {row['최대고객층비중']:.0f}%"),
             (g3, "하락 지속", row["추세점수"],
@@ -443,46 +486,46 @@ if view_mode == "분석용":
         col.markdown(f"**{label}** {val:.0f}점")
         col.progress(min(int(val), 100))
         col.caption(note)
-    st.caption(f"변동계수 {row['변동계수']:.3f} · 기간 평균 비중 {row['평균점유율']:.2f}% · "
-               f"종합 {score:.0f}점 (저점기 40% + 집중 30% + 하락 30%, 탐색적 가중치)")
+    st.caption(f"변동계수 {row['변동계수']:.3f} · 24개월 평균 비중 {row['평균점유율']:.2f}% · "
+               f"종합 {score:.0f}점 (잔존율 40% + 집중 30% + 하락 30%, 탐색적 가중치)")
 
     st.markdown("##### 대전 전체 순위")
     view = stat.copy()
     view["등급"] = pd.cut(view["리스크점수"], [-1, 33, 66, 101],
                         labels=["안심", "주의", "조심"])
-    for c in ["리스크점수", "저점점수", "집중점수", "추세점수"]:
+    for c in ["리스크점수", "정책점수", "집중점수", "추세점수"]:
         view[c] = view[c].round(0)
     view["잔존율"] = view["잔존율"].round(1)
-    st.dataframe(view[["지역", "동", "리스크점수", "등급", "저점점수",
+    st.dataframe(view[["지역", "동", "리스크점수", "등급", "정책점수",
                        "집중점수", "추세점수", "잔존율", "최대고객층"]],
                  hide_index=True, use_container_width=True)
 
 if view_mode == "분석용":
   with t5:
     st.markdown(f"""
-**상대적 결제 패턴 점수 구성**
+**리스크 점수 구성**
 
-| 지표 | 탐색적 가중치 | 무엇을 측정하나 |
+| 지표 | 가중치 | 무엇을 재나 |
 | --- | --- | --- |
-| 결제 저점기 민감도 | 40% | 대전 지역화폐 결제 총액이 적은 달과 많은 달의 해당 동 결제액 비율. 예산의 인과 효과를 뜻하지 않음 |
-| 이용 고객층 집중 | 30% | 지역화폐 결제액의 성별 × 연령대 허핀달 지수 |
-| 최근 점유율 하락 | 30% | 최근 6개월 중 전월보다 점유율이 낮아진 달 수와 최근 3개월 점유율 추세 |
+| 저점기 잔존율 | 40% | 대전 전체 결제가 가장 적었던 달의 결제액이, 가장 많았던 달의 몇 %인지. 낮을수록 전체 흐름에 크게 휩쓸린다. 저점의 원인이 정책인지는 이 지표만으로 확인되지 않는다 |
+| 고객층 집중 | 30% | 성별 × 연령대 결제액의 허핀달 지수. 한 집단에 쏠릴수록 그 집단의 소비가 줄 때 타격이 크다 |
+| 하락 지속 | 30% | 최근 6개월 중 전월보다 낮았던 달 수와 3개월 추세 |
 
-대전 내 분석 가능한 **{len(stat)}개 행정동**을 비교하여 상대 점수로 환산합니다. 점수는 절대적인 위험 확률이 아닙니다.
-가중치(40:30:30)는 서비스의 탐색적 설계값이며 학습·통계 검증을 통해 정해진 값이 아닙니다.
+세 지표를 분석 대상 동네 안에서 순위로 환산해 0~100점으로 만들고 가중 합산합니다. 가중치는 검증된 값이 아니라 탐색적으로 정한 설계값입니다.
 
-**자료 및 해석의 한계**
+**무엇을 보여주지 못하나**
 
-- 지역화폐 결제 데이터만 사용하며 일반 카드·현금 등 전체 점포 매출을 나타내지 않습니다.
-- 한 가게가 아니라 행정동의 집계 결과입니다. 데이터 수집이 불완전하거나 필터에서 탈락한 동은 평가에서 제외됩니다.
-- 저점기와 고점기의 차이가 지역화폐 정책 탓이라는 인과관계는 확인되지 않았습니다.
-- 이 점수로 상권 폐업률이나 개별 점포 폐업 위험을 예측할 수 없습니다.
-- 3개월 선형 예측에는 별도 백테스트가 없으므로 정확도를 보장하지 않습니다.
-- 실제 결제 데이터의 기준 시점은 화면 상단에 표시됩니다.
+- 상권 전체 매출이 아닙니다. 카드 · 현금 · 간편결제는 포함되지 않습니다.
+- 개별 점포가 아니라 행정동 단위입니다.
+- 폐업 위험을 예측하지 않습니다. 대전 일반음식점 63,889건(별도 분석)의 폐업률과 대조한 결과
+  유의미한 상관이 없었습니다(r=0.06, p=0.65). 시차를 둔 비교와 개업 대비 폐업 배율로도
+  마찬가지였습니다. 따라서 **매출이 흔들릴 가능성**을 보는 지표로 한정합니다.
+
+**참고 — 2025년에 실제로 있었던 일**
+
+대전 전체 지역화폐 결제액은 2025년 6월 약 14억 원에서 11월 약 889억 원으로 60배 넘게 늘었습니다.
+상권이 좋아진 것이 아니라 발행 예산이 복원된 결과입니다. 금액이 아니라 비중을 보는 이유입니다.
 """)
-    st.download_button("이 지역 월별 데이터 CSV 받기", data=d.to_csv(index=False).encode("utf-8-sig"),
-                       file_name=f"대전_{gu}_{dong}_지역화폐_월별.csv", mime="text/csv")
-
 
 st.divider()
 st.caption("출처 : 공공데이터포털 한국조폐공사 지역사랑상품권 결제정보, "
